@@ -8,6 +8,30 @@ repository.
 
 import logging
 
+
+import sys
+import os
+
+# Get the root directory of your project (WebMall)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# Add all src directories to the Python path
+src_dirs = [
+    os.path.join(project_root, 'BrowserGym', 'browsergym', 'core', 'src'),
+    os.path.join(project_root, 'BrowserGym', 'browsergym', 'webmall', 'src'),
+    os.path.join(project_root, 'BrowserGym', 'browsergym', 'experiments', 'src'),
+]
+
+for src_dir in src_dirs:
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+
+# Optionally, print sys.path to ensure everything is included
+print(sys.path)
+
+import browsergym.webmall
+
+
 from agentlab.agents.generic_agent import (
     AGENT_LLAMA3_70B,
     AGENT_LLAMA31_70B,
@@ -25,12 +49,13 @@ agent_args = [AGENT_4o_MINI]
 
 
 # ## select the benchmark to run on
-benchmark = "miniwob_tiny_test"
+# benchmark = "miniwob_tiny_test"
 # benchmark = "miniwob"
 # benchmark = "workarena_l1"
 # benchmark = "workarena_l2"
 # benchmark = "workarena_l3"
 # benchmark = "webarena"
+benchmark = "webmall"
 
 # Set reproducibility_mode = True for reproducibility
 # this will "ask" agents to be deterministic. Also, it will prevent you from launching if you have
@@ -42,7 +67,7 @@ reproducibility_mode = False
 relaunch = False
 
 ## Number of parallel jobs
-n_jobs = 4  # Make sure to use 1 job when debugging in VSCode
+n_jobs = 1  # Make sure to use 1 job when debugging in VSCode
 # n_jobs = -1  # to use all available cores
 
 
