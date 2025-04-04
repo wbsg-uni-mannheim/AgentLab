@@ -165,6 +165,7 @@ cython_debug/
 _sandbox.py
 
 results/
+/study_results
 
 # gradio
 .gradio/
