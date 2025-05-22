@@ -51,6 +51,13 @@ CHAT_MODEL_ARGS_DICT = {
         max_new_tokens=4_096,  # I think this model has very small default value if we don't set max_new_tokens
         vision_support=True,
     ),
+    "openai/gpt-4.1-2025-04-14": OpenAIModelArgs(
+        model_name="gpt-4.1-2025-04-14",
+        max_total_tokens=1_047_576,
+        max_input_tokens=1_047_576,
+        max_new_tokens=32_768,
+        vision_support=True,
+    ),
     "openai/gpt-3.5-turbo-0125": OpenAIModelArgs(
         model_name="gpt-3.5-turbo-0125",
         max_total_tokens=16_384,
