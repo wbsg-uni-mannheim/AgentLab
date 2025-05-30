@@ -5,6 +5,12 @@ from agentlab.llm.chat_api import (
     SelfHostedModelArgs,
 )
 
+# Import custom configurations
+try:
+    from agentlab.llm.custom_llm_configs import CUSTOM_CHAT_MODEL_ARGS_DICT
+except ImportError:
+    CUSTOM_CHAT_MODEL_ARGS_DICT = {}
+
 default_oss_llms_args = {
     "n_retry_server": 4,
     "temperature": 0.01,
@@ -49,13 +55,6 @@ CHAT_MODEL_ARGS_DICT = {
         max_total_tokens=128_000,
         max_input_tokens=128_000,
         max_new_tokens=4_096,  # I think this model has very small default value if we don't set max_new_tokens
-        vision_support=True,
-    ),
-    "openai/gpt-4.1-2025-04-14": OpenAIModelArgs(
-        model_name="gpt-4.1-2025-04-14",
-        max_total_tokens=1_047_576,
-        max_input_tokens=1_047_576,
-        max_new_tokens=32_768,
         vision_support=True,
     ),
     "openai/gpt-3.5-turbo-0125": OpenAIModelArgs(
@@ -207,3 +206,6 @@ CHAT_MODEL_ARGS_DICT = {
         temperature=1e-1,
     ),
 }
+
+# Merge custom configurations
+CHAT_MODEL_ARGS_DICT.update(CUSTOM_CHAT_MODEL_ARGS_DICT)
