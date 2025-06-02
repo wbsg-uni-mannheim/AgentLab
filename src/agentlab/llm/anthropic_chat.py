@@ -83,6 +83,8 @@ class AnthropicChatModel(AbstractChatModel):
 
     def _convert_messages_to_anthropic_format(self, messages: list[dict]) -> tuple[str, list[dict]]:
         """Convert OpenAI-style messages to Anthropic format."""
+        import re
+        
         system_message = ""
         converted_messages = []
         
@@ -93,7 +95,44 @@ class AnthropicChatModel(AbstractChatModel):
             if role == "system":
                 system_message = content
             elif role == "user":
-                converted_messages.append({"role": "user", "content": content})
+                # Handle both string content and list content (for images)
+                if isinstance(content, list):
+                    converted_content = []
+                    for item in content:
+                        if item.get("type") == "text":
+                            converted_content.append({"type": "text", "text": item["text"]})
+                        elif item.get("type") == "image_url":
+                            # Convert OpenAI image_url format to Anthropic image format
+                            image_url = item["image_url"]["url"]
+                            
+                            # Extract base64 data from data URL
+                            if image_url.startswith('data:image/'):
+                                # Parse data URL: data:image/png;base64,<base64_data>
+                                match = re.match(r'data:image/([^;]+);base64,(.+)', image_url)
+                                if match:
+                                    media_type = f"image/{match.group(1)}"
+                                    base64_data = match.group(2)
+                                else:
+                                    # Fallback
+                                    media_type = "image/png"
+                                    base64_data = image_url.split(',', 1)[1] if ',' in image_url else image_url
+                            else:
+                                # If it's just base64 data without data URL prefix
+                                media_type = "image/png"
+                                base64_data = image_url
+                            
+                            converted_content.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": base64_data
+                                }
+                            })
+                    converted_messages.append({"role": "user", "content": converted_content})
+                else:
+                    # Simple string content
+                    converted_messages.append({"role": "user", "content": content})
             elif role == "assistant":
                 converted_messages.append({"role": "assistant", "content": content})
         
