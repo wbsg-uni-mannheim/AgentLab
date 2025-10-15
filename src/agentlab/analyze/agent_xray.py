@@ -1,4 +1,5 @@
 import base64
+import html
 import os
 import traceback
 from copy import deepcopy
@@ -12,17 +13,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from attr import dataclass
-from browsergym.experiments.loop import ExpResult, StepInfo
-from langchain.schema import BaseMessage, HumanMessage
+from browsergym.experiments.loop import StepInfo as BGymStepInfo
 from openai import OpenAI
+from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
 
 from agentlab.analyze import inspect_results
+from agentlab.analyze.episode_to_html import exp_result_to_html
+from agentlab.analyze.overlay_utils import annotate_action
 from agentlab.experiments.exp_utils import RESULTS_DIR
+from agentlab.experiments.loop import ExpResult, StepInfo
 from agentlab.experiments.study import get_most_recent_study
 from agentlab.llm.chat_api import make_system_message, make_user_message
 from agentlab.llm.llm_utils import BaseMessage as AgentLabBaseMessage
 from agentlab.llm.llm_utils import Discussion
+from agentlab.llm.response_api import MessageBuilder, ToolCalls
+
+try:
+    from langchain.schema import BaseMessage, HumanMessage
+except ImportError:
+    BaseMessage, HumanMessage = None, None
 
 select_dir_instructions = "Select Experiment Directory"
 AGENT_NAME_KEY = "agent.agent_name"
@@ -69,6 +79,7 @@ class EpisodeId:
     agent_id: str = None
     task_name: str = None
     seed: int = None
+    row_index: int = None  # unique row index to disambiguate selections
 
 
 @dataclass
@@ -80,7 +91,7 @@ class StepId:
 @dataclass
 class Info:
     results_dir: Path = None  # to root directory of all experiments
-    exp_list_dir: Path = None  # the path of the currently selected experiment
+    study_dirs: Path = None  # the path of the currently selected experiment
     result_df: pd.DataFrame = None  # the raw loaded df
     agent_df: pd.DataFrame = None  # the df filtered for selected agent
     tasks_df: pd.DataFrame = None  # the unique tasks for selected agent
@@ -94,23 +105,17 @@ class Info:
         if self.result_df is None or episode_id.task_name is None or episode_id.seed is None:
             self.exp_result = None
 
-        # find unique row for task_name and seed
+        # find unique row using idx
         result_df = self.agent_df.reset_index(inplace=False)
-        sub_df = result_df[
-            (result_df[TASK_NAME_KEY] == episode_id.task_name)
-            & (result_df[TASK_SEED_KEY] == episode_id.seed)
-        ]
+        sub_df = result_df[result_df["_row_index"] == episode_id.row_index]
         if len(sub_df) == 0:
             self.exp_result = None
-            raise ValueError(
-                f"Could not find task_name: {episode_id.task_name} and seed: {episode_id.seed}"
-            )
+            raise ValueError(f"Could not find _row_index: {episode_id.row_index}")
 
         if len(sub_df) > 1:
             warning(
-                f"Found multiple rows for task_name: {episode_id.task_name} and seed: {episode_id.seed}. Using the first one."
+                f"Found multiple rows with same row_index {episode_id.row_index} Using the first one."
             )
-
         exp_dir = sub_df.iloc[0]["exp_dir"]
         print(exp_dir)
         self.exp_result = ExpResult(exp_dir)
@@ -123,16 +128,15 @@ class Info:
         return agent_id
 
     def filter_agent_id(self, agent_id: list[tuple]):
-        # query_str = " & ".join([f"`{col}` == {repr(val)}" for col, val in agent_id])
-        # agent_df = info.result_df.query(query_str)
-
-        agent_df = self.result_df.reset_index(inplace=False)
-        agent_df.set_index(TASK_NAME_KEY, inplace=True)
+        # Preserve a stable row index to disambiguate selections later
+        tmp_df = self.result_df.reset_index(inplace=False)
+        tmp_df["_row_index"] = tmp_df.index
+        tmp_df.set_index(TASK_NAME_KEY, inplace=True)
 
         for col, val in agent_id:
             col = col.replace(".\n", ".")
-            agent_df = agent_df[agent_df[col] == val]
-        self.agent_df = agent_df
+            tmp_df = tmp_df[tmp_df[col] == val]
+        self.agent_df = tmp_df
 
 
 info = Info()
@@ -160,6 +164,32 @@ th {
 }
 """
 
+# Keyboard shortcut JavaScript - based on https://github.com/gradio-app/gradio/issues/6101
+shortcut_js = """
+<script>
+function shortcuts(e) {
+    var event = document.all ? window.event : e;
+    switch (e.target.tagName.toLowerCase()) {
+        case "input":
+        case "textarea":
+        case "select":
+        case "button":
+            return;
+        default:
+            if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                if (e.key === 'ArrowLeft') {
+                    document.getElementById("prev_btn").click();
+                } else {
+                    document.getElementById("next_btn").click();
+                }
+            }
+    }
+}
+document.addEventListener('keydown', shortcuts, false);
+</script>
+"""
+
 
 def run_gradio(results_dir: Path):
     """
@@ -169,7 +199,7 @@ def run_gradio(results_dir: Path):
     global info
     info.results_dir = results_dir
 
-    with gr.Blocks(theme=gr.themes.Soft(), css=css) as demo:
+    with gr.Blocks(theme=gr.themes.Soft(), css=css, head=shortcut_js) as demo:
         agent_id = gr.State(value=None)
         episode_id = gr.State(value=EpisodeId())
         agent_task_id = gr.State(value=None)
@@ -201,10 +231,10 @@ clicking the refresh button.
 """
             )
         with gr.Row():
-
             exp_dir_choice = gr.Dropdown(
                 choices=get_directory_contents(results_dir),
                 value=select_dir_instructions,
+                multiselect=True,
                 label="Experiment Directory",
                 show_label=False,
                 scale=6,
@@ -296,6 +326,16 @@ clicking the refresh button.
             action_info = gr.Markdown(label="Action Info", elem_classes="my-markdown")
             state_error = gr.Markdown(label="Next Step Error", elem_classes="my-markdown")
 
+        with gr.Row(variant="panel", elem_classes=["items-center", "justify-center"]):
+            step_indicator = gr.Markdown("### Step 0/0", elem_classes=["text-center"])
+            prev_btn = gr.Button(
+                "◀ Previous", size="md", scale=0, elem_id="prev_btn", elem_classes=["mx-auto"]
+            )
+            next_btn = gr.Button(
+                "Next ▶", size="md", scale=0, elem_id="next_btn", elem_classes=["mx-auto"]
+            )
+            gr.Markdown("(Shortcut: Ctrl/Cmd + ← →)", elem_classes=["text-center"])
+
         profiling_gr = gr.Image(
             label="Profiling", show_label=False, interactive=False, show_download_button=False
         )
@@ -343,6 +383,9 @@ clicking the refresh button.
                     preview=True,
                 )
 
+            with gr.Tab("Episode") as tab_episode:
+                episode = gr.HTML()
+
             with gr.Tab("DOM HTML") as tab_html:
                 html_code = gr.Code(language="html", **code_args)
 
@@ -350,7 +393,7 @@ clicking the refresh button.
                 pruned_html_code = gr.Code(language="html", **code_args)
 
             with gr.Tab("AXTree") as tab_axtree:
-                axtree_code = gr.Code(language=None, **code_args)
+                axtree_code = gr.Markdown()
 
             with gr.Tab("Chat Messages") as tab_chat:
                 chat_messages = gr.Markdown()
@@ -452,6 +495,7 @@ clicking the refresh button.
             outputs=[screenshot_gallery],
         )
         screenshot_gallery.select(fn=gallery_step_change, inputs=episode_id, outputs=step_id)
+        episode_id.change(fn=if_active("Episode")(update_episode), outputs=episode)
         step_id.change(fn=if_active("DOM HTML")(update_html), outputs=html_code)
         step_id.change(
             fn=if_active("Pruned DOM HTML")(update_pruned_html), outputs=pruned_html_code
@@ -480,6 +524,7 @@ clicking the refresh button.
         tab_screenshot_gallery.select(
             fn=update_screenshot_gallery, inputs=som_or_not, outputs=[screenshot_gallery]
         )
+        tab_episode.select(fn=update_episode, outputs=episode)
         tab_html.select(fn=update_html, outputs=html_code)
         tab_pruned_html.select(fn=update_pruned_html, outputs=pruned_html_code)
         tab_axtree.select(fn=update_axtree, outputs=axtree_code)
@@ -497,6 +542,40 @@ clicking the refresh button.
 
         # keep track of active tab
         tabs.select(tab_select)
+
+        demo.load(fn=refresh_exp_dir_choices, inputs=exp_dir_choice, outputs=exp_dir_choice)
+
+        # Simple navigation button events
+        def navigate_prev(step_id: StepId):
+            global info
+            if step_id and step_id.step is not None and step_id.episode_id:
+                step = max(0, step_id.step - 1)
+                info.step = step
+                return StepId(episode_id=step_id.episode_id, step=step)
+            return step_id
+
+        def navigate_next(step_id: StepId):
+            global info
+            if step_id and step_id.step is not None and step_id.episode_id and info.exp_result:
+                step = min(len(info.exp_result.steps_info) - 1, step_id.step + 1)
+                info.step = step
+                return StepId(episode_id=step_id.episode_id, step=step)
+            return step_id
+
+        prev_btn.click(navigate_prev, inputs=[step_id], outputs=[step_id])
+        next_btn.click(navigate_next, inputs=[step_id], outputs=[step_id])
+
+        # Update step indicator display
+        def format_step_indicator(step_id):
+            global info
+            if not step_id or not info.exp_result or not info.exp_result.steps_info:
+                return "### Step 0/0"
+            # 1-based for user, total steps is len-1 (last is terminal)
+            current = (step_id.step + 1) if step_id.step is not None else 0
+            total = max(len(info.exp_result.steps_info) - 1, 0)
+            return f"### Step {current}/{total}"
+
+        step_id.change(format_step_indicator, inputs=[step_id], outputs=[step_indicator])
 
     demo.queue()
 
@@ -533,30 +612,51 @@ def if_active(tab_name, n_out=1):
 
 def update_screenshot(som_or_not: str):
     global info
-    return get_screenshot(info, som_or_not=som_or_not)
+    img, action_str = get_screenshot(info, som_or_not=som_or_not, annotate=True)
+    return img
 
 
-def get_screenshot(info: Info, step: int = None, som_or_not: str = "Raw Screenshots"):
+def get_screenshot(
+    info: Info, step: int = None, som_or_not: str = "Raw Screenshots", annotate: bool = False
+):
     if step is None:
         step = info.step
     try:
+        step_info = info.exp_result.steps_info[step]
         is_som = som_or_not == "SOM Screenshots"
-        return info.exp_result.get_screenshot(step, som=is_som)
-    except FileNotFoundError:
-        return None
+        img = info.exp_result.get_screenshot(step, som=is_som)
+        if annotate:
+            action_str = step_info.action
+            properties = step_info.obs.get("extra_element_properties", None)
+            try:
+                action_colored = annotate_action(
+                    img, action_string=action_str, properties=properties
+                )
+            except Exception as e:
+                warning(f"Failed to annotate action: {e}")
+                action_colored = action_str
+        else:
+            action_colored = None
+        return img, action_colored
+    except (FileNotFoundError, IndexError):
+        return None, None
 
 
 def update_screenshot_pair(som_or_not: str):
     global info
-    s1 = get_screenshot(info, info.step, som_or_not)
-    s2 = get_screenshot(info, info.step + 1, som_or_not)
+    s1, action_str = get_screenshot(info, info.step, som_or_not, annotate=True)
+    s2, action_str = get_screenshot(info, info.step + 1, som_or_not)
     return s1, s2
 
 
 def update_screenshot_gallery(som_or_not: str):
     global info
-    screenshots = info.exp_result.get_screenshots(som=som_or_not == "SOM Screenshots")
+    max_steps = len(info.exp_result.steps_info)
+
+    screenshots = [get_screenshot(info, step=i, som_or_not=som_or_not)[0] for i in range(max_steps)]
+
     screenshots_and_label = [(s, f"Step {i}") for i, s in enumerate(screenshots)]
+
     gallery = gr.Gallery(
         value=screenshots_and_label,
         columns=2,
@@ -575,6 +675,18 @@ def gallery_step_change(evt: gr.SelectData, episode_id: EpisodeId):
     return StepId(episode_id=episode_id, step=evt.index)
 
 
+# def update_episode():
+#     # get exp_results for the given episode_id
+#     return exp_result_to_html(info.exp_result)
+def update_episode():
+    html_content = exp_result_to_html(info.exp_result)
+
+    # Use srcdoc instead of data URL
+    return f"""<iframe srcdoc="{html.escape(html_content, quote=True)}" 
+                      style="width: 100%; height: 800px; border: none; background-color: white;">
+              </iframe>"""
+
+
 def update_html():
     return get_obs(key="dom_txt", default="No DOM HTML")
 
@@ -584,7 +696,92 @@ def update_pruned_html():
 
 
 def update_axtree():
-    return get_obs(key="axtree_txt", default="No AXTree")
+    obs = get_obs(key="axtree_txt", default="No AXTree")
+    return f"```\n{obs}\n```"
+
+
+def dict_to_markdown(d: dict):
+    """
+    Convert a dictionary to a clean markdown representation, recursively.
+
+    Args:
+        d (dict): A dictionary where keys are strings and values can be strings,
+                  lists of dictionaries, or nested dictionaries.
+
+    Returns:
+        str: A markdown-formatted string representation of the dictionary.
+    """
+    if not isinstance(d, dict):
+        if isinstance(d, ToolCalls):
+            # ToolCalls rendered by to_markdown method.
+            return ""
+        warning(f"Expected dict, got {type(d)}")
+        return repr(d)
+    if not d:
+        return "No Data"
+    res = ""
+    for k, v in d.items():
+        if isinstance(v, dict):
+            res += f"### {k}\n{dict_to_markdown(v)}\n"
+        elif isinstance(v, list):
+            res += f"### {k}\n"
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    res += f"#### Item {i}\n{dict_to_markdown(item)}\n"
+                else:
+                    res += f"- {item}\n"
+        else:
+            res += f"- **{k}**: {v}\n"
+    return res
+
+
+def dict_msg_to_markdown(d: dict):
+    if "role" not in d:
+        return dict_to_markdown(d)
+    parts = []
+    for item in d["content"]:
+
+        if hasattr(item, "dict"):
+            item = item.dict()
+
+        match item["type"]:
+            case "image":
+                parts.append(f"![Image]({item['image']})")
+            case "text":
+                parts.append(f"\n```\n{item['text']}\n```\n")
+            case "tool_use":
+                tool_use = _format_tool_call(item["name"], item["input"], item["id"])
+                parts.append(f"\n```\n{tool_use}\n```\n")
+            case _:
+                parts.append(f"\n```\n{str(item)}\n```\n")
+
+    markdown = f"### {d['role'].capitalize()}\n"
+    markdown += "\n".join(parts)
+    return markdown
+
+
+def _format_tool_call(name: str, input: str, call_id: str):
+    """
+    Format a tool call to markdown.
+    """
+    return f"Tool Call: {name}  `{input}` (call_id: {call_id})"
+
+
+def format_chat_message(message: BaseMessage | MessageBuilder | dict):
+    """
+    Format a message to markdown.
+    """
+    if BaseMessage and isinstance(message, BaseMessage):
+        return message.content
+    elif isinstance(message, MessageBuilder):
+        return message.to_markdown()
+    elif isinstance(message, dict):
+        return dict_msg_to_markdown(message)
+    elif isinstance(message, ResponseFunctionToolCall):  # type: ignore[return]
+        too_use_str = _format_tool_call(message.name, message.arguments, message.call_id)
+        return f"### Tool Use\n```\n{too_use_str}\n```\n"
+    else:
+        return str(message)
 
 
 def update_chat_messages():
@@ -593,14 +790,10 @@ def update_chat_messages():
     chat_messages = agent_info.get("chat_messages", ["No Chat Messages"])
     if isinstance(chat_messages, Discussion):
         return chat_messages.to_markdown()
-    messages = []  # TODO(ThibaultLSDC) remove this at some point
-    for i, m in enumerate(chat_messages):
-        if isinstance(m, BaseMessage):  # TODO remove once langchain is deprecated
-            m = m.content
-        elif isinstance(m, dict):
-            m = m.get("content", "No Content")
-        messages.append(f"""# Message {i}\n```\n{m}\n```\n\n""")
-    return "\n".join(messages)
+
+    if isinstance(chat_messages, list):
+        chat_messages = [format_chat_message(m) for m in chat_messages]
+        return "\n\n".join(chat_messages)
 
 
 def update_task_error():
@@ -617,7 +810,7 @@ def update_logs():
     try:
         return f"""{info.exp_result.logs}"""
     except FileNotFoundError:
-        return f"""No Logs"""
+        return """No Logs"""
 
 
 def update_stats():
@@ -647,9 +840,21 @@ def update_agent_info_html():
     global info
     # screenshots from current and next step
     try:
-        s1 = get_screenshot(info, info.step, False)
-        s2 = get_screenshot(info, info.step + 1, False)
+        s1, action_str = get_screenshot(info, info.step, False)
+        s2, action_str = get_screenshot(info, info.step + 1, False)
         agent_info = info.exp_result.steps_info[info.step].agent_info
+        # Minimal: show step_hints if present
+        hints = (
+            agent_info.get("step_hints")
+            or agent_info.get("hints")
+            or agent_info.get("extra_info", {}).get("step_hints")
+        )
+        if hints:
+            if not isinstance(hints, (list, tuple)):
+                hints = [hints]
+            items = "".join(f"<li>{html.escape(str(h))}</li>" for h in hints)
+            hints_html = f"<html><body><h3>Step Hints</h3><ul>{items}</ul></body></html>"
+            return _page_to_iframe(hints_html), s1, s2
         page = agent_info.get("html_page", ["No Agent Info"])
         if page is None:
             page = """Fill up html_page attribute in AgentInfo to display here."""
@@ -679,7 +884,9 @@ def submit_action(input_text):
     global info
     agent_info = info.exp_result.steps_info[info.step].agent_info
     chat_messages = deepcopy(agent_info.get("chat_messages", ["No Chat Messages"])[:2])
-    if isinstance(chat_messages[1], BaseMessage):  # TODO remove once langchain is deprecated
+    if BaseMessage and isinstance(
+        chat_messages[1], BaseMessage
+    ):  # TODO remove once langchain is deprecated
         assert isinstance(chat_messages[1], HumanMessage), "Second message should be user"
         chat_messages = [
             make_system_message(chat_messages[0].content),
@@ -742,6 +949,10 @@ def get_episode_info(info: Info):
     try:
         env_args = info.exp_result.exp_args.env_args
         steps_info = info.exp_result.steps_info
+        if info.step >= len(steps_info):
+            info.step = len(steps_info) - 1
+        if len(steps_info) == 0:
+            return "No steps were taken in this episode."
         step_info = steps_info[info.step]
         try:
             goal = step_info.obs["goal_object"]
@@ -757,20 +968,23 @@ def get_episode_info(info: Info):
 
         info = f"""\
 ### {env_args.task_name} (seed: {env_args.task_seed})
-### Step {info.step} / {len(steps_info)-1} (Reward: {cum_reward:.1f})
+### (Reward: {cum_reward:.1f})
 
 **Goal:**
 
-{code(str(AgentLabBaseMessage('', goal)))}
+{code(str(AgentLabBaseMessage("", goal)))}
 
 **Task info:**
 
 {code(step_info.task_info)}
 
+**Terminated or Truncated:**
+{code(f"Terminated: {step_info.terminated}, Truncated: {step_info.truncated}")}
+
 **exp_dir:**
 
 <small style="line-height: 1; margin: 0; padding: 0;">{code(exp_dir_str)}</small>"""
-    except Exception as e:
+    except Exception:
         info = f"""\
 **Error while getting episode info**
 {code(traceback.format_exc())}"""
@@ -779,6 +993,8 @@ def get_episode_info(info: Info):
 
 def get_action_info(info: Info):
     steps_info = info.exp_result.steps_info
+    img, action_str = get_screenshot(info, step=info.step, annotate=True)  # to update click_mapper
+
     if len(steps_info) == 0:
         return "No steps were taken"
     if len(steps_info) <= info.step:
@@ -788,7 +1004,7 @@ def get_action_info(info: Info):
     action_info = f"""\
 **Action:**
 
-{code(step_info.action)}
+{action_str}
 """
     think = step_info.agent_info.get("think", None)
     if think is not None:
@@ -821,7 +1037,8 @@ def get_seeds_df(result_df: pd.DataFrame, task_name: str):
     def extract_columns(row: pd.Series):
         return pd.Series(
             {
-                "seed": row[TASK_SEED_KEY],
+                "idx": row.get("_row_index", None),
+                "seed": row.get(TASK_SEED_KEY, None),
                 "reward": row.get("cum_reward", None),
                 "err": bool(row.get("err_msg", None)),
                 "n_steps": row.get("n_steps", None),
@@ -829,6 +1046,8 @@ def get_seeds_df(result_df: pd.DataFrame, task_name: str):
         )
 
     seed_df = result_df.apply(extract_columns, axis=1)
+    # Ensure column order and readability
+    seed_df = seed_df[["seed", "reward", "err", "n_steps", "idx"]]
     return seed_df
 
 
@@ -846,15 +1065,20 @@ def on_select_task(evt: gr.SelectData, df: pd.DataFrame, agent_id: list[tuple]):
 def update_seeds(agent_task_id: tuple):
     agent_id, task_name = agent_task_id
     seed_df = get_seeds_df(info.agent_df, task_name)
-    first_seed = seed_df.iloc[0]["seed"]
-    return seed_df, EpisodeId(agent_id=agent_id, task_name=task_name, seed=first_seed)
+    first_seed = int(seed_df.iloc[0]["seed"])
+    first_index = int(seed_df.iloc[0]["idx"])
+    return seed_df, EpisodeId(
+        agent_id=agent_id, task_name=task_name, seed=first_seed, row_index=first_index
+    )
 
 
 def on_select_seed(evt: gr.SelectData, df: pd.DataFrame, agent_task_id: tuple):
     agent_id, task_name = agent_task_id
     col_idx = df.columns.get_loc("seed")
-    seed = evt.row_value[col_idx]  # seed should be the first column
-    return EpisodeId(agent_id=agent_id, task_name=task_name, seed=seed)
+    idx_col = df.columns.get_loc("idx")
+    seed = evt.row_value[col_idx]
+    row_index = evt.row_value[idx_col]
+    return EpisodeId(agent_id=agent_id, task_name=task_name, seed=seed, row_index=row_index)
 
 
 def new_episode(episode_id: EpisodeId, progress=gr.Progress()):
@@ -928,38 +1152,42 @@ def get_agent_report(result_df: pd.DataFrame):
 
 
 def update_global_stats():
-    stats = inspect_results.global_report(info.result_df, reduce_fn=inspect_results.summarize_stats)
-    stats.reset_index(inplace=True)
-    return stats
+    try:
+        stats = inspect_results.global_report(
+            info.result_df, reduce_fn=inspect_results.summarize_stats
+        )
+        stats.reset_index(inplace=True)
+        return stats
+
+    except Exception as e:
+        warning(f"Error while updating global stats: {e}")
+        return None
 
 
 def update_error_report():
-    report_files = list(info.exp_list_dir.glob("error_report*.md"))
-    if len(report_files) == 0:
-        return "No error report found"
-    report_files = sorted(report_files, key=os.path.getctime, reverse=True)
-    return report_files[0].read_text()
+    return inspect_results.error_report(info.result_df, max_stack_trace=3, use_log=True)
 
 
-def new_exp_dir(exp_dir, progress=gr.Progress(), just_refresh=False):
+def new_exp_dir(study_names: list, progress=gr.Progress(), just_refresh=False):
+    global info
 
-    if exp_dir == select_dir_instructions:
-        return None, None
+    # remove select_dir_instructions from study_names
+    if select_dir_instructions in study_names:
+        study_names.remove(select_dir_instructions)
 
-    exp_dir = exp_dir.split(" - ")[0]
+    if len(study_names) == 0:
+        return None, None, None, None, None, None
 
-    if len(exp_dir) == 0:
-        info.exp_list_dir = None
-        return None, None
-
-    info.exp_list_dir = info.results_dir / exp_dir
-    info.result_df = inspect_results.load_result_df(info.exp_list_dir, progress_fn=progress.tqdm)
+    info.study_dirs = [info.results_dir / study_name.split(" - ")[0] for study_name in study_names]
+    info.result_df = inspect_results.load_result_df(info.study_dirs, progress_fn=progress.tqdm)
     info.result_df = remove_args_from_col(info.result_df)
 
     study_summary = inspect_results.summarize_study(info.result_df)
     # save study_summary
-    study_summary.to_csv(info.exp_list_dir / "summary_df.csv", index=False)
-    agent_report = display_table(study_summary)
+
+    for study_dir in info.study_dirs:
+        study_summary.to_csv(study_dir / "summary_df.csv", index=False)
+        agent_report = display_table(study_summary)
 
     info.agent_id_keys = agent_report.index.names
     agent_report.reset_index(inplace=True)
@@ -1003,8 +1231,11 @@ def get_directory_contents(results_dir: Path):
                 most_recent_summary = max(summary_files, key=os.path.getctime)
                 summary_df = pd.read_csv(most_recent_summary)
 
+                if len(summary_df) == 0:
+                    continue  # skip if all avg_reward are NaN
+
                 # get row with max avg_reward
-                max_reward_row = summary_df.loc[summary_df["avg_reward"].idxmax()]
+                max_reward_row = summary_df.loc[summary_df["avg_reward"].idxmax(skipna=True)]
                 reward = max_reward_row["avg_reward"] * 100
                 completed = max_reward_row["n_completed"]
                 n_err = max_reward_row["n_err"]
@@ -1012,7 +1243,7 @@ def get_directory_contents(results_dir: Path):
                     f" - avg-reward: {reward:.1f}% - completed: {completed} - errors: {n_err}"
                 )
         except Exception as e:
-            print(f"Error while reading summary file: {e}")
+            print(f"Error while reading summary file {most_recent_summary}: {e}")
 
         exp_descriptions.append(exp_description)
 
@@ -1075,13 +1306,21 @@ def add_patch(ax, start, stop, color, label, edge=False):
 
 
 def plot_profiling(ax, step_info_list: list[StepInfo], summary_info: dict, progress_fn):
-
     if len(step_info_list) == 0:
         warning("No step info to plot")
         return None
 
-    # this allows to pop labels to make sure we don't use more than 1 for the legend
-    labels = ["reset", "env", "agent", "exec action", "action error"]
+    # Updated labels to include new profiling stages
+    labels = [
+        "reset",
+        "env",
+        "agent",
+        "exec action",
+        "action error",
+        "wait for page",
+        "validation",
+        "get observation",
+    ]
     labels = {e: e for e in labels}
 
     colors = plt.get_cmap("tab20c").colors
@@ -1090,6 +1329,9 @@ def plot_profiling(ax, step_info_list: list[StepInfo], summary_info: dict, progr
     all_times = []
     step_times = []
     for i, step_info in progress_fn(list(enumerate(step_info_list)), desc="Building plot."):
+        assert isinstance(
+            step_info, (StepInfo, BGymStepInfo)
+        ), f"Expected StepInfo or BGymStepInfo, got {type(step_info)}"
         step = step_info.step
 
         prof = deepcopy(step_info.profiling)
@@ -1110,6 +1352,48 @@ def plot_profiling(ax, step_info_list: list[StepInfo], summary_info: dict, progr
             # action
             label = labels.pop("exec action", None)
             add_patch(ax, prof.action_exec_start, prof.action_exec_stop, colors[3], label)
+
+            # NEW: Add wait for page loading visualization
+            if (
+                hasattr(prof, "wait_for_page_loading_start")
+                and prof.wait_for_page_loading_start is not None
+                and prof.wait_for_page_loading_start > 0
+            ):
+                add_patch(
+                    ax,
+                    prof.wait_for_page_loading_start,
+                    prof.wait_for_page_loading_stop,
+                    colors[19],
+                    labels.pop("wait for page", None),
+                )
+
+            # NEW: Add validation visualization
+            if (
+                hasattr(prof, "validation_start")
+                and prof.validation_start is not None
+                and prof.validation_start > 0
+            ):
+                add_patch(
+                    ax,
+                    prof.validation_start,
+                    prof.validation_stop,
+                    colors[8],
+                    labels.pop("validation", None),
+                )
+
+            # NEW: Add get observation visualization
+            if (
+                hasattr(prof, "get_observation_start")
+                and prof.get_observation_start is not None
+                and prof.get_observation_start > 0
+            ):
+                add_patch(
+                    ax,
+                    prof.get_observation_start,
+                    prof.get_observation_stop,
+                    colors[12],
+                    labels.pop("get observation", None),
+                )
 
             try:
                 next_step_error = step_info_list[i + 1].obs["last_action_error"]
@@ -1139,7 +1423,6 @@ def plot_profiling(ax, step_info_list: list[StepInfo], summary_info: dict, progr
                 horizontalalignment="left",
                 rotation=0,
                 clip_on=True,
-                antialiased=True,
                 fontweight=1000,
                 backgroundcolor=colors[12],
             )
@@ -1171,14 +1454,13 @@ def plot_profiling(ax, step_info_list: list[StepInfo], summary_info: dict, progr
                 horizontalalignment="right",
                 rotation=0,
                 clip_on=True,
-                antialiased=True,
+                # antialiased=True,
                 fontweight=1000,
                 backgroundcolor=color,
             )
 
     ax.set_ylim(0, 1)
     ax.set_xlim(0, max(all_times) + 1)
-    # plt.gca().autoscale()
 
     ax.set_xlabel("Time")
     ax.set_yticks([])
@@ -1187,7 +1469,7 @@ def plot_profiling(ax, step_info_list: list[StepInfo], summary_info: dict, progr
     ax.legend(
         loc="upper center",
         bbox_to_anchor=(0.5, 1.2),
-        ncol=5,
+        ncol=8,  # Updated to accommodate new labels
         frameon=True,
     )
 
