@@ -14,13 +14,6 @@ import agentlab.llm.tracking as tracking
 from agentlab.llm.base_api import AbstractChatModel, BaseModelArgs
 from agentlab.llm.llm_utils import AIMessage, Discussion
 
-# Import Anthropic support if available (separate module to avoid conflicts during updates)
-try:
-    from agentlab.llm.anthropic_chat import AnthropicModelArgs, AnthropicChatModel
-except ImportError:
-    # Anthropic support not available
-    pass
-
 
 def make_system_message(content: str) -> dict:
     return dict(role="system", content=content)

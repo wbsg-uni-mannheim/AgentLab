@@ -1,19 +1,13 @@
 from openai import NOT_GIVEN
 
 from agentlab.llm.chat_api import (
-    AnthropicModelArgs,
     AzureModelArgs,
     BedrockModelArgs,
     OpenAIModelArgs,
     OpenRouterModelArgs,
     SelfHostedModelArgs,
+    AnthropicModelArgs,
 )
-
-# Import custom configurations
-try:
-    from agentlab.llm.custom_llm_configs import CUSTOM_CHAT_MODEL_ARGS_DICT
-except ImportError:
-    CUSTOM_CHAT_MODEL_ARGS_DICT = {}
 
 default_oss_llms_args = {
     "n_retry_server": 4,
@@ -381,6 +375,3 @@ CHAT_MODEL_ARGS_DICT = {
         temperature=1e-1,
     ),
 }
-
-# Merge custom configurations
-CHAT_MODEL_ARGS_DICT.update(CUSTOM_CHAT_MODEL_ARGS_DICT)
